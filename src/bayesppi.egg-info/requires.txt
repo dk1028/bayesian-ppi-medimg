@@ -1,0 +1,9 @@
+numpy
+scipy
+pandas
+matplotlib
+pymc>=5
+arviz
+xarray
+scikit-learn
+pyyaml
