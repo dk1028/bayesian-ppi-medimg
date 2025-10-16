@@ -52,19 +52,19 @@
 ## 1. Abstract (Paper Summary)
 
 Modern predictors trained on vast unlabeled corpora can be accurate yet systematically biased, complicating valid uncertainty quantification when only a small labeled set is available. **Prediction–Powered Inference (PPI)** debiases an imputed estimator using a *rectifier* computed on labeled data, yielding frequentist guarantees.
-We develop a **fully Bayesian** analogue of PPI for non-conjugate models using **MCMC (NUTS/HMC)**. Treating the PPI chain-rule as a generative model over **$$$1$$**, we couple abundant autorater outputs with scarce labels and propagate posterior uncertainty to the functional
-$$$1$$
-Across synthetic and medical-imaging experiments (Alzheimer’s disease MRI), our **Bayesian chain-rule estimator (CRE)** delivers calibrated intervals with competitive or shorter widths than (i) labeled-only Bayesian and (ii) classical difference estimators, while following best-practice Bayesian workflow (SBC, PPCs, $$$1$$, ESS, divergence checks).
+We develop a **fully Bayesian** analogue of PPI for non-conjugate models using **MCMC (NUTS/HMC)**. Treating the PPI chain-rule as a generative model over **(θ_A, θ_{H|1}, θ_{H|0})**, we couple abundant autorater outputs with scarce labels and propagate posterior uncertainty to the functional
+`g = P(H=1) = θ_A·θ_{H|1} + (1−θ_A)·θ_{H|0}`
+Across synthetic and medical-imaging experiments (Alzheimer’s disease MRI), our **Bayesian chain-rule estimator (CRE)** delivers calibrated intervals with competitive or shorter widths than (i) labeled-only Bayesian and (ii) classical difference estimators, while following best-practice Bayesian workflow (SBC, PPCs, R-hat, ESS, divergence checks).
 
 ---
 
 ## 2. What is Bayesian PPI? (One-Minute Intuition)
 
-* We observe a large pool of **autorater decisions** $$$1$$ and a much smaller set of **human labels** $$$1$$ on a subset.
-* The target prevalence $$$1$$ decomposes by the chain rule:
-  $$$1$$
-* Put **weak Beta priors** on $$$1$$, use Bernoulli likelihoods, run **NUTS** to sample the posterior, and transform draws to $$$1$$.
-* Result: **label-efficient**, calibrated credible intervals for $$$1$$, leveraging abundant predictions while correcting with few labels.
+* We observe a large pool of **autorater decisions** `A ∈ {0,1}` and a much smaller set of **human labels** `H ∈ {0,1}` on a subset.
+* The target prevalence `g = P(H=1)` decomposes by the chain rule:
+  `g = P(H=1|A=1)·P(A=1) + P(H=1|A=0)·P(A=0)`
+* Put **weak Beta priors** on `(θ_A, θ_{H|1}, θ_{H|0})`, use Bernoulli likelihoods, run **NUTS** to sample the posterior, and transform draws to `g`.
+* Result: **label-efficient**, calibrated credible intervals for `g`, leveraging abundant predictions while correcting with few labels.
 
 ---
 
@@ -305,44 +305,44 @@ Abundant autorater decisions **A** and scarce human labels **H**.
 
 **Parameters:**
 
-$$$1$$
+`θ_A = P(A=1)`, `θ_{H|1} = P(H=1|A=1)`, `θ_{H|0} = P(H=1|A=0)`
 
 **Estimand:**
 
-$$$1$$
+`g(θ) = θ_A·θ_{H|1} + (1−θ_A)·θ_{H|0}`
 
 Likelihood for unlabeled **A** and labeled pairs **(A, H)**; weak Beta priors (Uniform/Jeffreys).
 
-*Identifiability:* $$$1$$ from unlabeled pool; $$$1$$ from labeled subset; prior regularization handles small cells.
+*Identifiability:* `θ_A` from unlabeled pool; `(θ_{H|1}, θ_{H|0})` from labeled subset; prior regularization handles small cells.
 
 ### 7.2. Bayesian Computation & Diagnostics
 
 * NUTS/HMC via PyMC; sample logits for stability.
 * Defaults: `draws=2000`, `tune=1000`, `chains=2`, `target_accept≈0.90`.
-* Diagnostics: rank-normalized $$$1$$; bulk/tail ESS > 400; no divergences; E-BFMI > 0.3.
-* PPCs on $$$1$$ margins and induced $$$1$$.
+* Diagnostics: rank-normalized `R-hat < 1.01`; bulk/tail ESS > 400; no divergences; E-BFMI > 0.3.
+* PPCs on `2x2` margins and induced `g`.
 * SBC over synthetic draws to validate calibration.
 
 ### 7.3. Thresholds & Calibration
 
-Map probabilities $$$1$$ to decisions $$$1$$ using:
+Map probabilities `p` to decisions `A = 1{p ≥ t}` using:
 
-* fixed $$$1$$;
-* Youden’s $$$1$$ (maximize TPR+TNR−1);
+* fixed `t = 0.5`;
+* Youden’s `t*_Y` (maximize TPR+TNR−1);
 * cost-sensitive Bayes threshold
-  $$$1$$
+  `t* = [C10·(1−π)] / [C10·(1−π) + C01·π]`
 
-Reliability (calibration) via temperature scaling or isotonic regression before thresholding; AUC unchanged, decisions improved.
+Reliability (calibration) can be applied before thresholding via temperature scaling or isotonic regression; AUC unchanged, decisions improved.
 
-Refit CRE per $$$1$$ (and per stratum) so uncertainty reflects the induced $$$1$$.
+Refit CRE per `t` (and per stratum) so uncertainty reflects the induced `(θ_{H|1}, θ_{H|0})`.
 
 ### 7.4. Extensions: Binning and Hierarchies
 
-Replace $$$1$$ with $$$1$$ bins of score $$$1$$:
-$$$1$$
+Replace `A ∈ {0,1}` with `K` bins of score `p`:
+`g = Σ_k P(H=1|B=k) · P(B=k)`
 
-Hierarchical partial pooling across strata $$$1$$:
-$$$1$$
+Hierarchical partial pooling across strata `s`:
+`logit(θ_{·,s}) ~ Normal(μ_{·}, σ_{·}^2)`
 with weak hyperpriors; stabilizes group-wise estimates.
 
 ---
@@ -351,13 +351,13 @@ with weak hyperpriors; stabilizes group-wise estimates.
 
 ### 8.1. Simulations
 
-Match the generative model; typical setting: $$$1$$.
+Match the generative model; typical setting: `(θ_A, θ_{H|1}, θ_{H|0}) = (0.6, 0.8, 0.3), N_A = 1000, N_H = 100`.
 
-Vary label budgets $$$1$$; compare CRE vs Naïve Bayes (labeled-only) vs Difference Estimator (bootstrap CIs).
+Vary label budgets `n ∈ {10, 20, 40, 80}`; compare CRE vs Naïve Bayes (labeled-only) vs Difference Estimator (bootstrap CIs).
 
 ### 8.2. Coverage & Width Benchmarks
 
-Report absolute bias, RMSE, average 95% width, empirical coverage over $$$1$$ replications.
+Report absolute bias, RMSE, average 95% width, empirical coverage over `M = 50` replications.
 
 CRE typically yields near-nominal coverage with narrower intervals than baselines at fixed label budgets.
 
@@ -367,7 +367,7 @@ DICOM→NIfTI (`dcm2niix`), NiBabel I/O, 3D-CNN autorater (lightweight).
 
 Overall and age-stratified operating points (fixed vs Youden), plus calibration.
 
-Refit CRE per stratum; monitor prevalence $$$1$$ with calibrated uncertainty.
+Refit CRE per stratum; monitor prevalence `g` with calibrated uncertainty.
 
 ### 8.4. Seeds, SBC, PPCs
 
@@ -442,7 +442,7 @@ If you build on this code or ideas, please cite the paper (update year, openrevi
 
 * Angelopoulos et al., Prediction-Powered Inference (Science/ArXiv).
 * Särndal et al., Model Assisted Survey Sampling.
-* Vehtari et al., Rank-normalized $$$1$$, ESS; Bayesian workflow.
+* Vehtari et al., rank-normalized R-hat, ESS; Bayesian workflow.
 * Salvatier et al., PyMC; Carpenter et al., Stan; Hoffman & Gelman, NUTS; Betancourt, HMC.
 
 ---
