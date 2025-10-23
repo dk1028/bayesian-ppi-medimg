@@ -1,67 +1,234 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+simulation6570.py
+
+Prepare a matched table of CN/AD labels and NIfTI paths by merging:
+  (1) a 65–70 cohort metadata CSV (subject, group label, acquisition date)
+  (2) a filesystem of NIfTI files produced by dcm2niix
+
+Repository/TMLR-friendly upgrades:
+- No hard-coded paths: all I/O is CLI-driven
+- Robust column cleaning and validation
+- Flexible filename parsing (subject/date tokens)
+- Multiple date-format fallbacks
+- Clear logging and deterministic output
+- No interactive output; writes a CSV
+
+Examples
+--------
+# Basic usage (defaults mirror the original intent)
+python simulation6570.py \
+  --meta data/processed/6570year_7_18_2025.csv \
+  --nifti-root ADNI_NIfTI/ \
+  --out data/processed/matched_cn_ad_labels.csv
+
+# If your NIfTI filenames differ, specify token indices and formats:
+# <SUBJ_PART0>_<PART1>_<PART2>_<DATE_TOKEN>_... .nii.gz
+python simulation6570.py \
+  --meta data/processed/6570year_7_18_2025.csv \
+  --nifti-root ADNI_NIfTI/ \
+  --subject-token-idx 0 1 2 \
+  --date-token-idx 3 \
+  --date-token-fmt "%Y-%m-%d" \
+  --out data/processed/matched_cn_ad_labels.csv
+
+# If the meta CSV has different column names:
+python simulation6570.py \
+  --meta data/processed/meta.csv \
+  --meta-subject-col Subject \
+  --meta-group-col Group \
+  --meta-date-col Acq_Date \
+  --meta-date-fmts "%m/%d/%Y" "%Y-%m-%d" \
+  --nifti-root ADNI_NIfTI/ \
+  --out data/processed/matched.csv
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+from pathlib import Path
+from typing import Iterable, List, Optional
+
 import pandas as pd
-from pathlib import Path
 
-# 1) Read file (comma-separated CSV)
-META_CSV = Path(r"C:\Users\AV75950\Downloads\6570year_7_18_2025.csv")
-meta = pd.read_csv(META_CSV)  # sep="," is the default
 
-# 2) Clean column names: trim spaces and replace internal spaces with underscores
-meta.columns = (
-    meta.columns
-        .str.strip()             # remove leading/trailing spaces
-        .str.replace(' ', '_')   # "Acq Date" → "Acq_Date"
-)
+# ---------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------
+def setup_logging(level: str = "INFO") -> None:
+    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO),
+                        format="[%(levelname)s] %(message)s")
 
-# Check
-print("Cleaned columns:", meta.columns.tolist())
 
-# 3) Parse dates
-meta['Acq_Date'] = pd.to_datetime(
-    meta['Acq_Date'],
-    format='%m/%d/%Y',
-    errors='coerce'
-).dt.date
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Match meta CSV (65–70 cohort) to NIfTI files.")
+    p.add_argument("--meta", type=Path, required=True, help="Path to cohort metadata CSV.")
+    p.add_argument("--nifti-root", type=Path, required=True, help="Root directory containing subject subfolders with .nii.gz files.")
+    p.add_argument("--out", type=Path, required=True, help="Output CSV path for matches.")
 
-# Now keep only subject_id, label, Acq_Date
-meta = meta.rename(columns={'Subject':'subject_id', 'Group':'label'})
-meta = meta[['subject_id','label','Acq_Date']].drop_duplicates()
+    # Meta CSV column names (after cleaning)
+    p.add_argument("--meta-subject-col", type=str, default="Subject", help="Subject ID column in meta CSV (default: Subject).")
+    p.add_argument("--meta-group-col", type=str, default="Group", help="Group/label column in meta CSV (default: Group).")
+    p.add_argument("--meta-date-col", type=str, default="Acq_Date", help="Acquisition date column in meta CSV (default: Acq_Date).")
 
-# 4) NIfTI file matching (same as before)
-from pathlib import Path
-records = []
-NIFTI_ROOT = Path(r"C:\Users\AV75950\Documents\ADNI_NIfTI")
+    # Date parsing
+    p.add_argument("--meta-date-fmts", type=str, nargs="+",
+                   default=["%m/%d/%Y"], help="Allowed date formats for meta date (try in order).")
+    p.add_argument("--date-token-fmt", type=str, default="%Y-%m-%d",
+                   help="Date format used in NIfTI filename token (default: %%Y-%%m-%%d).")
 
-for subdir in NIFTI_ROOT.iterdir():
-    if not subdir.is_dir(): continue
-    for nii in subdir.glob("*.nii.gz"):
-        stem = nii.stem
-        parts = stem.split('_')
-        subject_id = "_".join(parts[:3])
-        date_str   = parts[3]
-        try:
-            scan_date = pd.to_datetime(date_str, format='%Y-%m-%d').date()
-        except:
+    # Filename tokenization: split by '_' and join subject tokens; date token index gives scan date
+    p.add_argument("--subject-token-idx", type=int, nargs="+", default=[0, 1, 2],
+                   help="Indices of filename tokens to join into subject_id (default: 0 1 2).")
+    p.add_argument("--date-token-idx", type=int, default=3,
+                   help="Index of the filename token containing the scan date (default: 3).")
+
+    # Glob pattern
+    p.add_argument("--glob", type=str, default="**/*.nii.gz", help="Glob pattern for NIfTI files under nifti-root.")
+
+    # Logging
+    p.add_argument("--log", type=str, default="INFO", help="Logging level (DEBUG, INFO, WARNING, ERROR).")
+    return p.parse_args()
+
+
+# ---------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------
+def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Trim whitespace and replace internal spaces with underscores."""
+    df = df.copy()
+    df.columns = (
+        df.columns
+        .str.strip()
+        .str.replace(r"\s+", "_", regex=True)
+    )
+    return df
+
+
+def parse_dates_with_fallback(s: pd.Series, fmts: List[str]) -> pd.Series:
+    """Try multiple date formats; return pandas datetime (date)."""
+    out = pd.to_datetime(s, errors="coerce", infer_datetime_format=False)
+    mask = out.isna()
+    for fmt in fmts:
+        if not mask.any():
+            break
+        try_out = pd.to_datetime(s[mask], format=fmt, errors="coerce")
+        out.loc[mask] = try_out
+        mask = out.isna()
+    return out.dt.date
+
+
+def extract_subject_and_date_from_filename(
+    path: Path,
+    subj_idx: List[int],
+    date_idx: int,
+    date_fmt: str,
+) -> Optional[tuple[str, pd.Timestamp]]:
+    """
+    Parse subject_id and scan_date from a NIfTI filename stem by splitting on '_'.
+    Returns (subject_id, date) or None if parsing fails.
+    """
+    stem = path.stem  # removes .nii.gz -> '.nii' -> 'name' behavior OK with Path.stem (only last suffix)
+    # Handle double suffix (.nii.gz) by stripping '.nii' if present
+    if stem.endswith(".nii"):
+        stem = stem[:-4]
+    parts = stem.split("_")
+    try:
+        subject_id = "_".join(parts[i] for i in subj_idx)
+        date_token = parts[date_idx]
+    except Exception:
+        return None
+    try:
+        scan_date = pd.to_datetime(date_token, format=date_fmt).date()
+    except Exception:
+        return None
+    return subject_id, scan_date
+
+
+# ---------------------------------------------------------------------
+# Core
+# ---------------------------------------------------------------------
+def main() -> None:
+    args = parse_args()
+    setup_logging(args.log)
+
+    # Load meta CSV
+    if not args.meta.exists():
+        raise FileNotFoundError(f"Meta CSV not found: {args.meta}")
+    meta = pd.read_csv(args.meta)
+    meta = clean_columns(meta)
+
+    # Validate required columns (after cleaning)
+    s_col, g_col, d_col = args.meta_subject_col, args.meta_group_col, args.meta_date_col
+    for col in (s_col, g_col, d_col):
+        if col not in meta.columns:
+            raise ValueError(f"Missing column '{col}' in meta CSV after cleaning. Found: {list(meta.columns)}")
+
+    # Parse dates in meta
+    meta[d_col] = parse_dates_with_fallback(meta[d_col], args.meta_date_fmts)
+    n_bad_dates = int(meta[d_col].isna().sum())
+    if n_bad_dates:
+        logging.warning("Meta CSV: %d rows have unparseable dates in '%s' and will be dropped.", n_bad_dates, d_col)
+    meta = meta.dropna(subset=[d_col]).copy()
+
+    # Keep only needed columns, normalize names
+    meta = meta.rename(columns={s_col: "subject_id", g_col: "label", d_col: "Acq_Date"})
+    meta = meta[["subject_id", "label", "Acq_Date"]].drop_duplicates()
+
+    logging.info("Meta rows after cleaning/dedup: %d", len(meta))
+
+    # Scan NIfTI directory
+    if not args.nifti_root.exists():
+        raise FileNotFoundError(f"NIfTI root not found: {args.nifti_root}")
+
+    records = []
+    n_scanned = 0
+    for nii in args.nifti_root.glob(args.glob):
+        if not nii.is_file():
             continue
-        records.append({
-            'subject_id': subject_id,
-            'scan_date' : scan_date,
-            'nifti_path': str(nii)
-        })
+        n_scanned += 1
+        parsed = extract_subject_and_date_from_filename(
+            nii, subj_idx=args.subject_token_idx, date_idx=args.date_token_idx, date_fmt=args.date_token_fmt
+        )
+        if parsed is None:
+            continue
+        subject_id, scan_date = parsed
+        records.append({"subject_id": subject_id, "scan_date": scan_date, "nifti_path": str(nii)})
 
-nifti_df = pd.DataFrame(records)
+    nifti_df = pd.DataFrame(records)
+    logging.info("Scanned %d files, parsed %d subject/date tokens.", n_scanned, len(nifti_df))
 
-# 5) Merge
-merged = pd.merge(
-    nifti_df,
-    meta,
-    left_on = ['subject_id','scan_date'],
-    right_on= ['subject_id','Acq_Date'],
-    how='inner'
-)
+    if nifti_df.empty:
+        logging.warning("No NIfTI files matched the parsing rules. Nothing to merge.")
+        # Still write an empty file with headers for reproducibility
+        out_empty = pd.DataFrame(columns=["subject_id", "scan_date", "nifti_path", "label", "Acq_Date"])
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        out_empty.to_csv(args.out, index=False)
+        logging.info("Wrote empty matches CSV: %s", args.out.resolve())
+        return
 
-print("Number of matched samples:", len(merged))
-print(merged.head())
+    # Merge by exact (subject_id, date)
+    merged = pd.merge(
+        nifti_df,
+        meta,
+        left_on=["subject_id", "scan_date"],
+        right_on=["subject_id", "Acq_Date"],
+        how="inner",
+    ).drop_duplicates()
 
-# 6) Save
-merged.to_csv("matched_cn_ad_labels.csv", index=False)
-print("✅ Saved to matched_cn_ad_labels.csv")
+    logging.info("Number of matched samples: %d", len(merged))
+    if len(merged):
+        logging.debug("\n%s", merged.head().to_string(index=False))
+
+    # Save
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    merged.to_csv(args.out, index=False)
+    logging.info("✅ Saved to %s", args.out.resolve())
+
+
+if __name__ == "__main__":
+    main()
